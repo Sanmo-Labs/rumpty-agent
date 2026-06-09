@@ -7,21 +7,22 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
-	"github.com/mdlayher/socket"
 	"golang.org/x/sys/unix"
 )
 
 func dialVSOCK(ctx context.Context, cid, port uint32) (WriteConn, error) {
-	conn, err := socket.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0, "vsock", nil)
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, fmt.Errorf("vsock socket: %w", err)
 	}
-	if _, err := conn.Connect(ctx, &unix.SockaddrVM{CID: cid, Port: port}); err != nil {
-		_ = conn.Close()
+	if err := unix.Connect(fd, &unix.SockaddrVM{CID: cid, Port: port}); err != nil {
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("vsock connect cid=%d port=%d: %w", cid, port, err)
 	}
-	return conn, nil
+	f := os.NewFile(uintptr(fd), fmt.Sprintf("vsock-cid%d-port%d", cid, port))
+	return &rawConn{f: f}, nil
 }
 
 func listenVSOCK(ctx context.Context, cfg ListenVSOCKConfig, handler ConnHandler) error {
@@ -30,11 +31,7 @@ func listenVSOCK(ctx context.Context, cfg ListenVSOCKConfig, handler ConnHandler
 		return fmt.Errorf("vsock socket: %w", err)
 	}
 
-	addr := &unix.SockaddrVM{
-		CID:  unix.VMADDR_CID_ANY,
-		Port: cfg.Port,
-	}
-	if err := unix.Bind(fd, addr); err != nil {
+	if err := unix.Bind(fd, &unix.SockaddrVM{CID: unix.VMADDR_CID_ANY, Port: cfg.Port}); err != nil {
 		_ = unix.Close(fd)
 		return fmt.Errorf("vsock bind port %d: %w", cfg.Port, err)
 	}
@@ -43,7 +40,6 @@ func listenVSOCK(ctx context.Context, cfg ListenVSOCKConfig, handler ConnHandler
 		return fmt.Errorf("vsock listen: %w", err)
 	}
 
-	// net.FileListener does not support AF_VSOCK — use raw unix.Accept instead.
 	go func() {
 		<-ctx.Done()
 		_ = unix.Close(fd)
@@ -59,13 +55,27 @@ func listenVSOCK(ctx context.Context, cfg ListenVSOCKConfig, handler ConnHandler
 				return fmt.Errorf("vsock accept: %w", err)
 			}
 		}
-		connFile := os.NewFile(uintptr(connFD), "vsock-conn")
-		conn, err := net.FileConn(connFile)
-		_ = connFile.Close()
-		if err != nil {
-			_ = unix.Close(connFD)
-			continue
-		}
+		// net.FileConn calls getsockname which fails for AF_VSOCK — wrap directly.
+		conn := &rawConn{f: os.NewFile(uintptr(connFD), "vsock-conn")}
 		go handler(conn)
 	}
 }
+
+// rawConn wraps an os.File as a net.Conn without any socket-type introspection.
+type rawConn struct {
+	f *os.File
+}
+
+func (c *rawConn) Read(b []byte) (int, error)         { return c.f.Read(b) }
+func (c *rawConn) Write(b []byte) (int, error)        { return c.f.Write(b) }
+func (c *rawConn) Close() error                       { return c.f.Close() }
+func (c *rawConn) LocalAddr() net.Addr                { return vsockAddr{} }
+func (c *rawConn) RemoteAddr() net.Addr               { return vsockAddr{} }
+func (c *rawConn) SetDeadline(t time.Time) error      { return c.f.SetDeadline(t) }
+func (c *rawConn) SetReadDeadline(t time.Time) error  { return c.f.SetReadDeadline(t) }
+func (c *rawConn) SetWriteDeadline(t time.Time) error { return c.f.SetWriteDeadline(t) }
+
+type vsockAddr struct{}
+
+func (vsockAddr) Network() string { return "vsock" }
+func (vsockAddr) String() string  { return "vsock" }
