@@ -43,21 +43,14 @@ func listenVSOCK(ctx context.Context, cfg ListenVSOCKConfig, handler ConnHandler
 		return fmt.Errorf("vsock listen: %w", err)
 	}
 
-	file := os.NewFile(uintptr(fd), "vsock")
-	ln, err := net.FileListener(file)
-	_ = file.Close()
-	if err != nil {
-		_ = unix.Close(fd)
-		return fmt.Errorf("wrap vsock listener: %w", err)
-	}
-
+	// net.FileListener does not support AF_VSOCK — use raw unix.Accept instead.
 	go func() {
 		<-ctx.Done()
-		_ = ln.Close()
+		_ = unix.Close(fd)
 	}()
 
 	for {
-		conn, err := ln.Accept()
+		connFD, _, err := unix.Accept(fd)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -65,6 +58,13 @@ func listenVSOCK(ctx context.Context, cfg ListenVSOCKConfig, handler ConnHandler
 			default:
 				return fmt.Errorf("vsock accept: %w", err)
 			}
+		}
+		connFile := os.NewFile(uintptr(connFD), "vsock-conn")
+		conn, err := net.FileConn(connFile)
+		_ = connFile.Close()
+		if err != nil {
+			_ = unix.Close(connFD)
+			continue
 		}
 		go handler(conn)
 	}
