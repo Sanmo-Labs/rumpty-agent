@@ -4,25 +4,68 @@ package transport
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"os"
 
 	"github.com/mdlayher/socket"
 	"golang.org/x/sys/unix"
 )
 
-type addrlessConn struct {
-	*socket.Conn
-}
-
 func dialVSOCK(ctx context.Context, cid, port uint32) (WriteConn, error) {
 	conn, err := socket.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0, "vsock", nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("vsock socket: %w", err)
 	}
-
 	if _, err := conn.Connect(ctx, &unix.SockaddrVM{CID: cid, Port: port}); err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("vsock connect cid=%d port=%d: %w", cid, port, err)
+	}
+	return conn, nil
+}
+
+func listenVSOCK(ctx context.Context, cfg ListenVSOCKConfig, handler ConnHandler) error {
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return fmt.Errorf("vsock socket: %w", err)
 	}
 
-	return addrlessConn{Conn: conn}, nil
+	addr := &unix.SockaddrVM{
+		CID:  unix.VMADDR_CID_ANY,
+		Port: cfg.Port,
+	}
+	if err := unix.Bind(fd, addr); err != nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("vsock bind port %d: %w", cfg.Port, err)
+	}
+	if err := unix.Listen(fd, 8); err != nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("vsock listen: %w", err)
+	}
+
+	// net.FileListener does not support AF_VSOCK — use raw unix.Accept instead.
+	go func() {
+		<-ctx.Done()
+		_ = unix.Close(fd)
+	}()
+
+	for {
+		connFD, _, err := unix.Accept(fd)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return fmt.Errorf("vsock accept: %w", err)
+			}
+		}
+		connFile := os.NewFile(uintptr(connFD), "vsock-conn")
+		conn, err := net.FileConn(connFile)
+		_ = connFile.Close()
+		if err != nil {
+			_ = unix.Close(connFD)
+			continue
+		}
+		go handler(conn)
+	}
 }
