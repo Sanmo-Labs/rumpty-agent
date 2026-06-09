@@ -2,20 +2,33 @@
 Description=Rumpty guest agent
 Documentation=https://github.com/Sanmo-Labs/rumpty-agent
 After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/rumpty-agent daemon
 Restart=always
-RestartSec=5s
+RestartSec=3s
+
+# Run as root for AF_VSOCK binding.
 User=root
 Group=root
+
+# File descriptor limits.
+LimitNOFILE=65536
+
+# Restart on non-zero exits.
+RestartForceExitStatus=1
+
+# --- Hardening ---
 NoNewPrivileges=true
+# Socket families for claim, SSH/HTTP, and logging.
+RestrictAddressFamilies=AF_UNIX AF_VSOCK AF_INET AF_INET6
 CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_VSOCK
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# Keep PrivateDevices off for /dev/vsock access.
 PrivateDevices=false
 ProtectKernelTunables=true
 ProtectKernelModules=true

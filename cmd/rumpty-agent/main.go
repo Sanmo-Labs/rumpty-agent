@@ -63,6 +63,7 @@ func runDaemon(ctx context.Context, args []string, stderr io.Writer) error {
 
 	var hostCID uint
 	var port uint
+	var claimPort uint
 	var root string
 	var sampleWindow time.Duration
 	var sampleInterval time.Duration
@@ -74,6 +75,7 @@ func runDaemon(ctx context.Context, args []string, stderr io.Writer) error {
 
 	fs.UintVar(&hostCID, "vsock-cid", agent.DefaultHostCID, "host VSOCK CID")
 	fs.UintVar(&port, "vsock-port", agent.DefaultPort, "collector VSOCK port")
+	fs.UintVar(&claimPort, "claim-port", uint(agent.DefaultClaimPort), "VSOCK port to listen on for orchestrator claim payloads")
 	fs.StringVar(&root, "root", "/", "root filesystem path to inspect")
 	fs.DurationVar(&sampleWindow, "sample-window", agent.DefaultSampleWindow, "network and CPU sample window")
 	fs.DurationVar(&sampleInterval, "sample-interval", agent.DefaultSampleInterval, "metrics collection interval")
@@ -94,6 +96,17 @@ func runDaemon(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 
 	logger := log.New(stderr, "rumpty-agent: ", log.LstdFlags|log.LUTC)
+
+	claimLogger := log.New(stderr, "rumpty-agent claim: ", log.LstdFlags|log.LUTC)
+	go func() {
+		if err := agent.RunClaimServer(ctx, agent.ClaimServerConfig{
+			Port:   uint32(claimPort),
+			Logger: claimLogger,
+		}); err != nil {
+			claimLogger.Printf("claim server exited: %v", err)
+		}
+	}()
+
 	return agent.RunDaemon(ctx, agent.DaemonConfig{
 		AgentVersion:   version,
 		AgentCommit:    commit,
@@ -161,9 +174,14 @@ func printUsage(w io.Writer) {
 Rumpty guest agent.
 
 Usage:
-  rumpty-agent daemon [--vsock-cid 2] [--vsock-port 5000]
+  rumpty-agent daemon [--vsock-cid 2] [--vsock-port 5000] [--claim-port 2222]
   rumpty-agent metrics once [--pretty] [--sample-window 1s]
   rumpty-agent version
+
+Flags (daemon):
+  --vsock-cid     Host VSOCK CID to push metrics to (default 2)
+  --vsock-port    Collector port on the host (default 5000)
+  --claim-port    VSOCK port to listen on for orchestrator claim payloads (default 2222)
 
 The agent only reports local guest telemetry. It does not read user files,
 environment variables, shell history, SSH keys, or application secrets.
