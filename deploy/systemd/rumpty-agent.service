@@ -10,7 +10,8 @@ ExecStart=/usr/bin/rumpty-agent daemon
 Restart=always
 RestartSec=3s
 
-# Run as root for AF_VSOCK binding.
+# Run as root: required for AF_VSOCK binding, SSH key deployment (chown),
+# hostname configuration, and startup script execution.
 User=root
 Group=root
 
@@ -21,24 +22,41 @@ LimitNOFILE=65536
 RestartForceExitStatus=1
 
 # --- Hardening ---
-NoNewPrivileges=true
-# Socket families for claim, SSH/HTTP, and logging.
-RestrictAddressFamilies=AF_UNIX AF_VSOCK AF_INET AF_INET6
-CapabilityBoundingSet=
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-# Keep PrivateDevices off for /dev/vsock access.
+
+# Allow access to /home for SSH key deployment.
+ProtectHome=false
+
+# Allow writes to /etc (hostname/hosts) and /var (startup scripts, state).
+ProtectSystem=false
+
+# Retain necessary capabilities: chown for SSH key ownership, DAC_OVERRIDE
+# for file access across users, FOWNER/FSETID for permission bits.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID
+
+# Must be off: mkhomedir_helper is a setuid helper that needs to elevate.
+NoNewPrivileges=false
+
+# Must be off: startup scripts are written then executed by bash.
+MemoryDenyWriteExecute=false
+
+# Keep /dev/vsock accessible.
 PrivateDevices=false
+
+# Private /tmp is safe and fine.
+PrivateTmp=true
+
+# Only allow socket families needed for VSOCK claim + SSH/HTTP probing + logging.
+RestrictAddressFamilies=AF_UNIX AF_VSOCK AF_INET AF_INET6
+
+# Kernel-level protections that don't affect the claim workflow.
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
-RestrictNamespaces=true
 ProtectProc=invisible
+RestrictNamespaces=true
+LockPersonality=true
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
-LockPersonality=true
-MemoryDenyWriteExecute=true
 
 [Install]
 WantedBy=multi-user.target
