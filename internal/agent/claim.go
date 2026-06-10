@@ -75,6 +75,19 @@ func applySSHKeys(username string, keys []ClaimSSHKey, logger *log.Logger) error
 		return fmt.Errorf("resolve home dir for %q: %w", username, err)
 	}
 
+	if _, statErr := os.Stat(homeDir); os.IsNotExist(statErr) {
+		logger.Printf("home dir %q missing — creating it for user %q", homeDir, username)
+		if out, mkErr := exec.Command("mkhomedir_helper", username).CombinedOutput(); mkErr != nil {
+			logger.Printf("warn: mkhomedir_helper %q: %v — %s, falling back to mkdir", username, mkErr, out)
+			if mkErr2 := os.MkdirAll(homeDir, 0o750); mkErr2 != nil {
+				return fmt.Errorf("create home dir %s: %w", homeDir, mkErr2)
+			}
+			if out, chErr := exec.Command("chown", username+":"+username, homeDir).CombinedOutput(); chErr != nil {
+				logger.Printf("warn: chown home dir %s: %v — %s", homeDir, chErr, out)
+			}
+		}
+	}
+
 	sshDir := homeDir + "/.ssh"
 	if err := os.MkdirAll(sshDir, 0o700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", sshDir, err)
