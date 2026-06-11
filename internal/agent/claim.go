@@ -26,6 +26,10 @@ type ClaimPayload struct {
 	GuestUsername string        `json:"guest_username"`
 	SSHKeys       []ClaimSSHKey `json:"ssh_keys"`
 	StartupScript string        `json:"startup_script,omitempty"`
+	Engine        string        `json:"engine,omitempty"`
+	DatabaseName  string        `json:"database_name,omitempty"`
+	Username      string        `json:"username,omitempty"`
+	Password      string        `json:"password,omitempty"`
 }
 
 // ClaimSSHKey is an SSH public key.
@@ -40,10 +44,17 @@ func HandleClaimPayload(cfg ClaimServerConfig, p ClaimPayload) error {
 		logger = log.New(os.Stderr, "rumpty-agent claim: ", log.LstdFlags)
 	}
 
-	if strings.TrimSpace(p.Action) != "claim" {
-		return fmt.Errorf("unknown action %q (expected \"claim\")", p.Action)
+	switch strings.TrimSpace(p.Action) {
+	case "claim":
+		return handleVMClaimPayload(p, logger)
+	case "database.claim":
+		return handleDatabaseClaimPayload(p, logger)
+	default:
+		return fmt.Errorf("unknown action %q", p.Action)
 	}
+}
 
+func handleVMClaimPayload(p ClaimPayload, logger *log.Logger) error {
 	if err := applySSHKeys(p.GuestUsername, p.SSHKeys, logger); err != nil {
 		return fmt.Errorf("apply ssh keys: %w", err)
 	}
@@ -62,6 +73,202 @@ func HandleClaimPayload(cfg ClaimServerConfig, p ClaimPayload) error {
 	}
 
 	return nil
+}
+
+func handleDatabaseClaimPayload(p ClaimPayload, logger *log.Logger) error {
+	switch strings.ToLower(strings.TrimSpace(p.Engine)) {
+	case "postgres", "postgresql":
+		return applyPostgresClaim(p.DatabaseName, p.Username, p.Password, logger)
+	case "mysql":
+		return applyMySQLClaim(p.DatabaseName, p.Username, p.Password, logger)
+	case "redis":
+		return applyRedisClaim(p.Password, logger)
+	default:
+		return fmt.Errorf("unsupported database claim engine %q", p.Engine)
+	}
+}
+
+func applyPostgresClaim(databaseName string, username string, password string, logger *log.Logger) error {
+	databaseName = strings.TrimSpace(databaseName)
+	username = strings.TrimSpace(username)
+	if databaseName == "" || username == "" || password == "" {
+		return fmt.Errorf("database_name, username, and password are required")
+	}
+
+	if out, err := exec.Command("systemctl", "is-active", "--quiet", "postgresql").CombinedOutput(); err != nil {
+		logger.Printf("postgresql is not active, attempting start: %v — %s", err, out)
+		if startOut, startErr := exec.Command("systemctl", "start", "postgresql").CombinedOutput(); startErr != nil {
+			return fmt.Errorf("start postgresql: %w — %s", startErr, startOut)
+		}
+	}
+
+	sql := fmt.Sprintf(`
+ALTER USER %s WITH PASSWORD %s;
+SELECT 'CREATE DATABASE %s OWNER %s' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = %s)\gexec
+GRANT ALL PRIVILEGES ON DATABASE %s TO %s;
+`, sqlIdentifier(username), sqlLiteral(password), sqlIdentifier(databaseName), sqlIdentifier(username), sqlLiteral(databaseName), sqlIdentifier(databaseName), sqlIdentifier(username))
+
+	cmd := exec.Command("runuser", "-u", "postgres", "--", "psql", "-v", "ON_ERROR_STOP=1")
+	cmd.Stdin = strings.NewReader(sql)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("apply postgres claim: %w — %s", err, out)
+	}
+
+	logger.Printf("postgres database claim applied database=%q username=%q", databaseName, username)
+	return nil
+}
+
+func applyMySQLClaim(databaseName string, username string, password string, logger *log.Logger) error {
+	databaseName = strings.TrimSpace(databaseName)
+	username = strings.TrimSpace(username)
+	if databaseName == "" || username == "" || password == "" {
+		return fmt.Errorf("database_name, username, and password are required")
+	}
+
+	service := "mysql"
+	if out, err := exec.Command("systemctl", "is-active", "--quiet", service).CombinedOutput(); err != nil {
+		logger.Printf("mysql is not active, trying mariadb/start: %v — %s", err, out)
+		if startOut, startErr := exec.Command("systemctl", "start", service).CombinedOutput(); startErr != nil {
+			service = "mariadb"
+			if mariaOut, mariaErr := exec.Command("systemctl", "start", service).CombinedOutput(); mariaErr != nil {
+				return fmt.Errorf("start mysql/mariadb: %w — %s; mysql output: %s", mariaErr, mariaOut, startOut)
+			}
+		}
+	}
+
+	configureMySQLNetwork(logger)
+	_ = exec.Command("systemctl", "restart", service).Run()
+
+	sql := fmt.Sprintf(`
+CREATE DATABASE IF NOT EXISTS %s;
+CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s;
+ALTER USER %s@'%%' IDENTIFIED BY %s;
+GRANT ALL PRIVILEGES ON %s.* TO %s@'%%';
+FLUSH PRIVILEGES;
+`, mysqlIdentifier(databaseName), mysqlLiteral(username), mysqlLiteral(password), mysqlLiteral(username), mysqlLiteral(password), mysqlIdentifier(databaseName), mysqlLiteral(username))
+
+	cmd := exec.Command("mysql", "-uroot")
+	cmd.Stdin = strings.NewReader(sql)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("apply mysql claim: %w — %s", err, out)
+	}
+
+	logger.Printf("mysql database claim applied database=%q username=%q", databaseName, username)
+	return nil
+}
+
+func configureMySQLNetwork(logger *log.Logger) {
+	for _, path := range []string{"/etc/mysql/mysql.conf.d/mysqld.cnf", "/etc/mysql/mariadb.conf.d/50-server.cnf"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var out strings.Builder
+		changed := false
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "bind-address") {
+				out.WriteString("bind-address = 0.0.0.0\n")
+				changed = true
+				continue
+			}
+			out.WriteString(line)
+			out.WriteByte('\n')
+		}
+		if changed {
+			if err := os.WriteFile(path, []byte(out.String()), 0o644); err != nil {
+				logger.Printf("warn: update mysql bind-address %s: %v", path, err)
+			}
+		}
+	}
+}
+
+func applyRedisClaim(password string, logger *log.Logger) error {
+	if strings.TrimSpace(password) == "" {
+		return fmt.Errorf("password is required")
+	}
+
+	service := "redis-server"
+	if out, err := exec.Command("systemctl", "is-active", "--quiet", service).CombinedOutput(); err != nil {
+		logger.Printf("redis-server is not active, trying redis/start: %v — %s", err, out)
+		if startOut, startErr := exec.Command("systemctl", "start", service).CombinedOutput(); startErr != nil {
+			service = "redis"
+			if redisOut, redisErr := exec.Command("systemctl", "start", service).CombinedOutput(); redisErr != nil {
+				return fmt.Errorf("start redis: %w — %s; redis-server output: %s", redisErr, redisOut, startOut)
+			}
+		}
+	}
+
+	conf, err := findRedisConfig()
+	if err != nil {
+		return err
+	}
+	if err := rewriteRedisConfig(conf, password); err != nil {
+		return err
+	}
+	if out, err := exec.Command("systemctl", "restart", service).CombinedOutput(); err != nil {
+		return fmt.Errorf("restart redis: %w — %s", err, out)
+	}
+
+	logger.Printf("redis claim applied")
+	return nil
+}
+
+func findRedisConfig() (string, error) {
+	for _, path := range []string{"/etc/redis/redis.conf", "/etc/redis.conf"} {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("redis config not found")
+}
+
+func rewriteRedisConfig(path string, password string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read redis config: %w", err)
+	}
+	var out strings.Builder
+	seenRequirePass := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "bind "):
+			out.WriteString("bind 0.0.0.0 ::\n")
+		case strings.HasPrefix(trimmed, "protected-mode "):
+			out.WriteString("protected-mode no\n")
+		case strings.HasPrefix(trimmed, "requirepass "):
+			out.WriteString("requirepass " + password + "\n")
+			seenRequirePass = true
+		default:
+			out.WriteString(line)
+			out.WriteByte('\n')
+		}
+	}
+	if !seenRequirePass {
+		out.WriteString("\nrequirepass " + password + "\n")
+	}
+	if err := os.WriteFile(path, []byte(out.String()), 0o644); err != nil {
+		return fmt.Errorf("write redis config: %w", err)
+	}
+	return nil
+}
+
+func sqlIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
+}
+
+func sqlLiteral(value string) string {
+	return `'` + strings.ReplaceAll(value, `'`, `''`) + `'`
+}
+
+func mysqlIdentifier(value string) string {
+	return "`" + strings.ReplaceAll(value, "`", "``") + "`"
+}
+
+func mysqlLiteral(value string) string {
+	return `'` + strings.ReplaceAll(value, `'`, `''`) + `'`
 }
 
 // applySSHKeys configures the authorized_keys file for the guest user.
