@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime/debug"
 	"strings"
 )
 
@@ -421,6 +422,13 @@ func HandleClaimConn(cfg ClaimServerConfig, conn interface {
 	}
 
 	defer conn.Close()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			stack := debug.Stack()
+			logger.Printf("panic while handling claim payload: %v\n%s", recovered, stack)
+			_, _ = conn.Write([]byte(fmt.Sprintf("err: panic while handling claim: %v\n%s", recovered, stack)))
+		}
+	}()
 
 	scanner := bufio.NewScanner(conn)
 	scanner.Buffer(make([]byte, 64*1024), 64*1024)
