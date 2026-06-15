@@ -450,6 +450,23 @@ func HandleClaimConn(cfg ClaimServerConfig, conn interface {
 		return
 	}
 
+	if strings.TrimSpace(payload.Action) == "kubernetes.get_kubeconfig" {
+		if _, err := os.Stat("/var/lib/rumpty/k3s-control-plane-ready"); os.IsNotExist(err) {
+			_, _ = conn.Write([]byte("err: kubeconfig not ready\n"))
+			return
+		}
+		data, err := os.ReadFile("/var/lib/rumpty/kubeconfig")
+		if err != nil {
+			logger.Printf("read kubeconfig: %v", err)
+			_, _ = conn.Write([]byte("err: read kubeconfig failed\n"))
+			return
+		}
+		_, _ = conn.Write([]byte("ok\n"))
+		_, _ = conn.Write(data)
+		logger.Printf("kubeconfig retrieved successfully")
+		return
+	}
+
 	if err := HandleClaimPayload(cfg, payload); err != nil {
 		logger.Printf("handle claim payload: %v", err)
 		msg := fmt.Sprintf("err: %s\n", err.Error())
